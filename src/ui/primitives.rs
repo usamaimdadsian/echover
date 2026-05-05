@@ -6,6 +6,7 @@ use crate::ui::{
     theme::Theme,
 };
 
+#[allow(dead_code)]
 pub fn draw_rect<T: Renderer>(canvas: &mut Canvas<T>, rect: Rect, color: Color) {
     let mut path = Path::new();
     path.rect(rect.x, rect.y, rect.width, rect.height);

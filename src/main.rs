@@ -1,4 +1,8 @@
 mod app;
+mod domain;
+mod library;
+mod playback;
+mod persistence;
 mod ui;
 mod window;
 

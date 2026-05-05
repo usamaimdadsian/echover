@@ -9,3 +9,5 @@ src-tauri/Cargo.lock
 *.log
 target/
 .codex
+data
+library
