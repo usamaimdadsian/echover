@@ -15,3 +15,7 @@ target/
 # module) or `src/data/` etc. of similar names.
 /data/
 /library/
+
+# Visual-spec bundle (1.6 MB exported HTML). Kept locally as the design
+# reference but never tracked, and purged from history.
+/design/
