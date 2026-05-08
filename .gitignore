@@ -19,3 +19,7 @@ target/
 # Visual-spec bundle (1.6 MB exported HTML). Kept locally as the design
 # reference but never tracked, and purged from history.
 /design/
+
+# Personal scratch notes — kept on disk, not tracked.
+
+/NOTES.md
