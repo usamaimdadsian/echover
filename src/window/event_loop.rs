@@ -21,7 +21,7 @@ use crate::ui::theme::Theme;
 use crate::window::renderer::Renderer;
 
 /// Smart-resume rewind on startup: jump back this far so the user re-hears
-/// some context. 
+/// some context.
 const SMART_RESUME_REWIND_MS: i64 = 5_000;
 const SEEK_BACKWARD_SECS: u64 = 15;
 const SEEK_FORWARD_SECS: u64 = 30;
