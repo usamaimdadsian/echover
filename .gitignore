@@ -9,5 +9,9 @@ src-tauri/Cargo.lock
 *.log
 target/
 .codex
-data
-library
+
+
+# Anchor to the repo root so we don't clobber `src/library/` (the scanner
+# module) or `src/data/` etc. of similar names.
+/data/
+/library/
