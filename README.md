@@ -7,8 +7,7 @@ top of **Vulkan via `ash`**, **`winit`**, **`fontdue`**, **`tiny-skia`**, and
 The UI is hand-drawn — every panel, button and icon is a quad submitted to a
 single graphics pipeline that branches in the fragment shader between an SDF
 rounded-rect and a sampled glyph. There's no widget toolkit; the whole
-interface fits in a couple hundred lines of layout code per page. The visual
-direction comes from `design/design.html`.
+interface fits in a couple hundred lines of layout code per page.
 
 ## Quick start
 
@@ -45,7 +44,7 @@ to force a fresh schema + mock seed on the next run.
   every theme size; tiny-skia renders 15 vector icons (sidebar nav,
   transport, search, heart, etc.) into the same R8 atlas at startup.
 - **Pages**: Home (Continue Listening + Recently played), Library (search
-  + filter chips + grid), Player (cover, transport, live progress),
+  - filter chips + grid), Player (cover, transport, live progress),
   Bookmarks, Settings (folders + playback controls), Book Detail (chapter
   list).
 - **Hover / pressed visuals** — every clickable surface tints by 8 % / 18 %
