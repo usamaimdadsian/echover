@@ -2,16 +2,41 @@
 name = "echover"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.77"
 
 [dependencies]
-femtovg = "0.9"
-glow = "0.16"
-glutin = "0.32"
-glutin-winit = "0.5"
+# Vulkan via raw bindings. The `window/` module is the only one that touches
+# `ash` types; everything above sees a small renderer trait.
+ash = "0.38"
+ash-window = "0.13"
 raw-window-handle = "0.6"
-rodio = "0.22"
-rusqlite = { version = "0.32", features = ["bundled"] }
+winit = "0.30"
+
+# Logging.
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Lean, pure-Rust glyph rasterizer. Pre-rasterized into a single R8 atlas at
+# init — no system font enumeration, no harfbuzz, no per-frame CPU work.
+fontdue = "0.9"
+
+# Pure-Rust 2D rasterizer. Used once at startup to bake the design's vector
+# icons into the same atlas. Already in the dep tree transitively via winit's
+# sctk-adwaita on Linux, so the explicit dep is essentially free.
+tiny-skia = "0.11"
+
+# Native folder picker for the "Add audiobook" action.
+rfd = "0.15"
+
+# Audio playback. Single dependency, single-process; we wrap it behind
+# `playback::engine::PlaybackEngine` so the backend can be swapped later.
+rodio = "0.22"
+
+# Persistence: bundled SQLite for the audiobook library + playback state.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Recursive directory walker used by the library scanner.
 walkdir = "2.5"
-winit = "0.30"
+
+[dev-dependencies]
+tempfile = "3"

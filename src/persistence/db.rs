@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     domain::audiobook::Audiobook,
+    domain::audiobook_file::AudiobookFile,
     domain::bookmark::Bookmark,
     library::scanner::{scan_library_folder, ScannedAudiobook},
 };
@@ -22,6 +23,20 @@ pub struct MinimalPlaybackState {
     pub position_ms: i64,
     pub last_played_at: String,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BookmarkWithTitle {
+    pub audiobook_id: u64,
+    pub book_title: String,
+    pub note: String,
+    pub position_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryFolderWithCount {
+    pub path: String,
+    pub book_count: u32,
 }
 
 impl Database {
@@ -103,13 +118,15 @@ impl Database {
         if !scan_root.exists() {
             return Ok(());
         }
+        self.scan_and_ingest_from(&scan_root)
+    }
 
-        self.upsert_library_folder(&scan_root)?;
-        let scanned = scan_library_folder(&scan_root);
+    pub fn scan_and_ingest_from(&self, scan_root: &Path) -> Result<(), String> {
+        self.upsert_library_folder(scan_root)?;
+        let scanned = scan_library_folder(scan_root);
         for audiobook in scanned {
             self.upsert_scanned_audiobook(audiobook)?;
         }
-
         Ok(())
     }
 
@@ -189,10 +206,11 @@ impl Database {
                 SELECT
                     a.id, a.title, a.author, a.narrator, a.description, a.cover_path,
                     a.total_duration_ms, a.created_at, a.updated_at,
-                    COALESCE(p.position_ms, 0) AS position_ms
+                    COALESCE(p.position_ms, 0) AS position_ms,
+                    COALESCE(p.completed, 0) AS completed
                 FROM audiobooks a
                 LEFT JOIN playback_states p ON p.audiobook_id = a.id
-                ORDER BY a.updated_at DESC, a.id DESC
+                ORDER BY COALESCE(p.last_played_at, a.updated_at) DESC, a.id DESC
                 ",
             )
             .map_err(|error| format!("failed to prepare audiobook query: {error}"))?;
@@ -201,6 +219,7 @@ impl Database {
             .query_map([], |row| {
                 let total_duration_ms: i64 = row.get(6)?;
                 let position_ms: i64 = row.get(9)?;
+                let completed: i64 = row.get(10)?;
                 let progress = if total_duration_ms > 0 {
                     (position_ms as f32 / total_duration_ms as f32).clamp(0.0, 1.0)
                 } else {
@@ -220,12 +239,129 @@ impl Database {
                     progress,
                     duration_text: format_duration_text(total_duration_ms),
                     current_chapter: "Chapter 1".to_owned(),
+                    completed: completed != 0,
                 })
             })
             .map_err(|error| format!("failed to query audiobooks: {error}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("failed to decode audiobooks: {error}"))
+    }
+
+    /// Return the file path for a given 1-based chapter index. Chapters map
+    /// directly to `audiobook_files` rows ordered by `(disc, file_index)`.
+    pub fn file_path_for_chapter(
+        &self,
+        audiobook_id: u64,
+        chapter_index_1_based: u32,
+    ) -> Result<Option<String>, String> {
+        if chapter_index_1_based == 0 {
+            return Ok(None);
+        }
+        let offset = (chapter_index_1_based - 1) as i64;
+        self.conn
+            .query_row(
+                "
+                SELECT path
+                FROM audiobook_files
+                WHERE audiobook_id = ?1
+                ORDER BY disc_number ASC, file_index ASC, track_number ASC, id ASC
+                LIMIT 1 OFFSET ?2
+                ",
+                params![audiobook_id as i64, offset],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("failed to query chapter file path: {error}"))
+    }
+
+    pub fn load_files_for_audiobook(&self, audiobook_id: u64) -> Result<Vec<AudiobookFile>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, audiobook_id, path, file_index, duration_ms, format,
+                       disc_number, track_number
+                FROM audiobook_files
+                WHERE audiobook_id = ?1
+                ORDER BY disc_number ASC, file_index ASC, track_number ASC, id ASC
+                ",
+            )
+            .map_err(|error| format!("failed to prepare audiobook_files query: {error}"))?;
+
+        let rows = stmt
+            .query_map(params![audiobook_id as i64], |row| {
+                Ok(AudiobookFile {
+                    id: row.get::<_, i64>(0)? as u64,
+                    audiobook_id: row.get::<_, i64>(1)? as u64,
+                    path: row.get(2)?,
+                    file_index: row.get(3)?,
+                    duration_ms: row.get(4)?,
+                    format: row.get(5)?,
+                    disc_number: row.get(6)?,
+                    track_number: row.get(7)?,
+                })
+            })
+            .map_err(|error| format!("failed to query audiobook_files: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to decode audiobook_files: {error}"))
+    }
+
+    pub fn load_all_bookmarks_with_titles(&self) -> Result<Vec<BookmarkWithTitle>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT b.audiobook_id, a.title, b.note, b.position_ms
+                FROM bookmarks b
+                JOIN audiobooks a ON a.id = b.audiobook_id
+                ORDER BY b.created_at DESC, b.id DESC
+                ",
+            )
+            .map_err(|error| format!("failed to prepare bookmarks-with-titles query: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BookmarkWithTitle {
+                    audiobook_id: row.get::<_, i64>(0)? as u64,
+                    book_title: row.get(1)?,
+                    note: row.get(2)?,
+                    position_ms: row.get(3)?,
+                })
+            })
+            .map_err(|error| format!("failed to query bookmarks-with-titles: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to decode bookmarks-with-titles: {error}"))
+    }
+
+    pub fn load_library_folders_with_counts(
+        &self,
+    ) -> Result<Vec<LibraryFolderWithCount>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT lf.path,
+                       (SELECT COUNT(*)
+                          FROM audiobooks a
+                         WHERE a.source_folder_path = lf.path
+                            OR a.source_folder_path LIKE lf.path || '/%') AS book_count
+                FROM library_folders lf
+                ORDER BY lf.path ASC
+                ",
+            )
+            .map_err(|error| format!("failed to prepare library_folders query: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok(LibraryFolderWithCount {
+                    path: row.get(0)?,
+                    book_count: count.max(0) as u32,
+                })
+            })
+            .map_err(|error| format!("failed to query library_folders: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to decode library_folders: {error}"))
     }
 
     pub fn first_file_path_for_audiobook(&self, audiobook_id: u64) -> Result<Option<String>, String> {

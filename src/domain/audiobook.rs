@@ -13,4 +13,5 @@ pub struct Audiobook {
     pub progress: f32,
     pub duration_text: String,
     pub current_chapter: String,
+    pub completed: bool,
 }

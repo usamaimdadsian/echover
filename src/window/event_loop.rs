@@ -1,56 +1,52 @@
-use std::{
-    num::NonZeroU32,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
-use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
-use glutin::display::GetGlDisplay;
-use glutin::prelude::*;
-use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
-use glutin_winit::DisplayBuilder;
-use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::playback::{engine::PlaybackEngine, rodio_engine::RodioPlaybackEngine};
 use crate::persistence::db::Database;
+use crate::playback::engine::PlaybackEngine;
+use crate::playback::rodio_engine::RodioPlaybackEngine;
 use crate::ui::action::UiAction;
-use crate::ui::state::{AppPage, AppState, PlaybackStatus};
+use crate::ui::data::Library;
+use crate::ui::font::Font;
+use crate::ui::hit::{hit_test, HitRegion, Interaction};
+use crate::ui::primitives::DrawList;
+use crate::ui::shell;
+use crate::ui::state::AppState;
+use crate::ui::theme::Theme;
 use crate::window::renderer::Renderer;
 
-const PLAYBACK_TICK_INTERVAL: Duration = Duration::from_secs(1);
-const PLAYBACK_PERSIST_INTERVAL: Duration = Duration::from_secs(7);
-const RESUME_REWIND_SECONDS: i64 = 10;
-const BOOKMARK_TOAST_SECONDS: u64 = 2;
+/// Smart-resume rewind on startup: jump back this far so the user re-hears
+/// some context. 
+const SMART_RESUME_REWIND_MS: i64 = 5_000;
+const SEEK_BACKWARD_SECS: u64 = 15;
+const SEEK_FORWARD_SECS: u64 = 30;
+/// While playing we redraw at this cadence so the progress bar advances.
+const PLAYING_TICK: Duration = Duration::from_millis(500);
 
-pub fn run(initial_app_state: AppState, database: Database) -> Result<(), String> {
+pub fn run(initial_state: AppState, db: Database) -> Result<(), String> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("failed to create event loop: {error}"))?;
-    let mut app = EchoverApp::new(initial_app_state, database);
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = EchoverApp {
+        pending_state: Some(initial_state),
+        pending_db: Some(db),
+        window_state: None,
+    };
     event_loop
         .run_app(&mut app)
         .map_err(|error| format!("event loop terminated with error: {error}"))
 }
 
 struct EchoverApp {
+    pending_state: Option<AppState>,
+    pending_db: Option<Database>,
     window_state: Option<WindowState>,
-    initial_app_state: Option<AppState>,
-    database: Option<Database>,
-}
-
-impl EchoverApp {
-    fn new(initial_app_state: AppState, database: Database) -> Self {
-        Self {
-            window_state: None,
-            initial_app_state: Some(initial_app_state),
-            database: Some(database),
-        }
-    }
 }
 
 impl ApplicationHandler for EchoverApp {
@@ -58,22 +54,51 @@ impl ApplicationHandler for EchoverApp {
         if self.window_state.is_some() {
             return;
         }
-
-        let app_state = self
-            .initial_app_state
-            .take()
-            .unwrap_or_else(AppState::default);
-        let database = self.database.take().expect("database should exist once");
-
-        match WindowState::new(event_loop, app_state, database) {
-            Ok(mut state) => {
-                state.request_redraw("ui state change");
+        tracing::info!("event loop resumed, creating window");
+        let app_state = self.pending_state.take().unwrap_or_default();
+        let Some(db) = self.pending_db.take() else {
+            tracing::error!("missing database handle on resume");
+            event_loop.exit();
+            return;
+        };
+        match WindowState::new(event_loop, app_state, db) {
+            Ok(state) => {
+                tracing::info!("window + renderer initialized");
+                state.window.request_redraw();
                 self.window_state = Some(state);
             }
             Err(error) => {
                 tracing::error!("{error}");
                 event_loop.exit();
             }
+        }
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            if let Some(state) = self.window_state.as_ref() {
+                if state.app_state.is_playing {
+                    state.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.window_state.as_ref() else {
+            return;
+        };
+        if state.app_state.is_playing {
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + PLAYING_TICK));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.window_state.as_mut() {
+            state.persist_position();
         }
     }
 
@@ -86,24 +111,19 @@ impl ApplicationHandler for EchoverApp {
         let Some(state) = self.window_state.as_mut() else {
             return;
         };
-
         if state.window.id() != window_id {
             return;
         }
 
         match event {
-            WindowEvent::CloseRequested => {
-                state.persist_before_exit();
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 state.resize(size);
-                state.request_redraw("window resize");
+                state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                let size = state.window.inner_size();
-                state.resize(size);
-                state.request_redraw("window resize");
+                state.resize(state.window.inner_size());
+                state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = state.render() {
@@ -112,224 +132,492 @@ impl ApplicationHandler for EchoverApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.app_state.mouse_position = (position.x as f32, position.y as f32);
-                state.app_state.interaction.hovered_action =
-                    state.renderer.action_at(state.app_state.mouse_position);
-                state.request_redraw("mouse move");
+                state.cursor_moved(position);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                state.cursor_left();
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                state.modifiers = mods;
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
-                state.app_state.interaction.mouse_down = true;
-                let mut redraw_reason = "mouse click";
-
-                if let Some(action) = state.renderer.handle_click(state.app_state.mouse_position) {
-                    tracing::info!(?action, "ui action triggered");
-                    if state.dispatch_action(action) {
-                        redraw_reason = "ui state change";
-                    }
-                }
-
-                state.request_redraw(redraw_reason);
+                state.mouse_pressed();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
             } => {
-                state.app_state.interaction.mouse_down = false;
-                state.request_redraw("mouse click");
+                state.mouse_released();
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let delta = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
-                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
-                };
-
-                if state.app_state.scroll_current_page_by(delta) {
-                    state.request_redraw("mouse scroll");
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
-                }
-
-                let mut changed = false;
-                match &event.logical_key {
-                    Key::Named(NamedKey::Space) => {
-                        changed = state.dispatch_action(UiAction::PlayPause);
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        changed = state.dispatch_action(UiAction::SeekBackward);
-                    }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        changed = state.dispatch_action(UiAction::SeekForward);
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        changed = state.app_state.pop_search_char();
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        changed = state.app_state.clear_transient_ui();
-                        tracing::info!("escape pressed: clear focus/overlay placeholder");
-                    }
-                    Key::Character(text) => {
-                        if text.eq_ignore_ascii_case("b")
-                            && matches!(
-                                state.app_state.current_page,
-                                crate::ui::state::AppPage::Player
-                            )
-                        {
-                            changed = state.dispatch_action(UiAction::AddBookmark);
-                            tracing::info!("bookmark action triggered");
-                        } else {
-                            for ch in text.chars() {
-                                if !ch.is_control() {
-                                    changed |= state.app_state.append_search_char(ch);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                if changed {
-                    state.request_redraw("ui state change");
-                }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key,
+                        text,
+                        ..
+                    },
+                ..
+            } => {
+                state.handle_key(event_loop, logical_key, text);
             }
             _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.window_state.as_mut() {
-            state.handle_periodic_playback_tick(Instant::now());
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + PLAYBACK_TICK_INTERVAL,
-            ));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
 
 struct WindowState {
     window: Window,
-    gl_context: PossiblyCurrentContext,
-    gl_surface: Surface<WindowSurface>,
     renderer: Renderer,
-    database: Database,
-    playback_engine: Box<dyn PlaybackEngine>,
-    loaded_file_path: Option<String>,
-    resume_load_requested: bool,
-    last_playback_persist_at: Instant,
+    theme: Theme,
     app_state: AppState,
-    pending_redraw_reason: Option<&'static str>,
-    render_count: u64,
+    cursor: (f32, f32),
+    hit_regions: Vec<HitRegion>,
+    draw_list: DrawList,
+    font: Font,
+    modifiers: Modifiers,
+    interaction: Interaction,
+    engine: Option<RodioPlaybackEngine>,
+    db: Database,
 }
 
 impl WindowState {
-    fn new(event_loop: &ActiveEventLoop, app_state: AppState, database: Database) -> Result<Self, String> {
-        let window_attributes = WindowAttributes::default()
-            .with_title("Echover")
-            .with_inner_size(PhysicalSize::new(1200, 800))
-            .with_resizable(true);
-
-        let config_template = ConfigTemplateBuilder::new().with_alpha_size(8);
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attributes));
-
-        let (window, gl_config) = display_builder
-            .build(event_loop, config_template, choose_gl_config)
-            .map_err(|error| format!("failed to create window/display: {error}"))?;
-
-        let window = window.ok_or_else(|| "glutin returned no window".to_owned())?;
-        let raw_window_handle = window
-            .window_handle()
-            .map_err(|error| format!("failed to fetch raw window handle: {error}"))?
-            .as_raw();
-
-        let context_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
-            .build(Some(raw_window_handle));
-        let fallback_context_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(None))
-            .build(Some(raw_window_handle));
-
-        let gl_display = gl_config.display();
-
-        let not_current_context = unsafe {
-            gl_display
-                .create_context(&gl_config, &context_attributes)
-                .or_else(|_| gl_display.create_context(&gl_config, &fallback_context_attributes))
-        }
-        .map_err(|error| format!("failed to create OpenGL context: {error}"))?;
+    fn new(
+        event_loop: &ActiveEventLoop,
+        mut app_state: AppState,
+        db: Database,
+    ) -> Result<Self, String> {
+        let window = event_loop
+            .create_window(
+                WindowAttributes::default()
+                    .with_title("Echover")
+                    .with_inner_size(PhysicalSize::new(1200, 800))
+                    .with_resizable(true),
+            )
+            .map_err(|error| format!("failed to create window: {error}"))?;
 
         let size = window.inner_size();
-        let gl_surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            raw_window_handle,
-            non_zero(size.width),
-            non_zero(size.height),
-        );
+        let font = Font::load_default()?;
+        let renderer =
+            Renderer::new(&window, size.width.max(1), size.height.max(1), &font.atlas)?;
 
-        let gl_surface = unsafe {
-            gl_config
-                .display()
-                .create_window_surface(&gl_config, &gl_surface_attributes)
-        }
-        .map_err(|error| format!("failed to create window surface: {error}"))?;
-
-        let gl_context = not_current_context
-            .make_current(&gl_surface)
-            .map_err(|error| format!("failed to activate OpenGL context: {error}"))?;
-
-        if let Err(error) = gl_surface.set_swap_interval(
-            &gl_context,
-            SwapInterval::Wait(NonZeroU32::new(1).expect("1 is non-zero")),
-        ) {
-            tracing::warn!("failed to set vsync: {error}");
-        }
-
-        let renderer = Renderer::new(
-            &gl_config,
-            size.width.max(1),
-            size.height.max(1),
-            window.scale_factor() as f32,
-        )?;
-        let playback_engine = Box::new(RodioPlaybackEngine::new()?);
-        let resume_load_requested = app_state.position_ms > 0 && app_state.current_file_path.is_some();
-        let mut state = Self {
-            window,
-            gl_context,
-            gl_surface,
-            renderer,
-            database,
-            playback_engine,
-            loaded_file_path: None,
-            resume_load_requested,
-            last_playback_persist_at: Instant::now(),
-            app_state,
-            pending_redraw_reason: None,
-            render_count: 0,
+        let engine = match RodioPlaybackEngine::new() {
+            Ok(engine) => Some(engine),
+            Err(error) => {
+                tracing::warn!(%error, "audio engine unavailable; UI runs read-only");
+                None
+            }
         };
 
-        state.load_bookmarks_for_current_book();
-        Ok(state)
+        // Smart-resume: pre-seed playback_position_ms for the current book.
+        if let Some(book) = app_state.library.current_listening() {
+            if let Ok(Some(saved)) = db.load_playback_state_for_audiobook(book.id) {
+                let resumed = (saved.position_ms - SMART_RESUME_REWIND_MS).max(0);
+                app_state.playback_position_ms = resumed;
+                tracing::info!(
+                    audiobook = book.id,
+                    saved_ms = saved.position_ms,
+                    resume_ms = resumed,
+                    "restored playback position"
+                );
+            }
+        }
+
+        Ok(Self {
+            window,
+            renderer,
+            theme: Theme::default(),
+            app_state,
+            cursor: (-1.0, -1.0),
+            hit_regions: Vec::new(),
+            draw_list: DrawList::default(),
+            font,
+            modifiers: Modifiers::default(),
+            interaction: Interaction::default(),
+            engine,
+            db,
+        })
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        if let Err(error) = self.renderer.resize(size.width, size.height) {
+            tracing::error!("{error}");
+        }
+    }
 
-        self.gl_surface.resize(
-            &self.gl_context,
-            non_zero(size.width),
-            non_zero(size.height),
-        );
-        self.renderer
-            .resize(size.width, size.height, self.window.scale_factor() as f32);
+    fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
+        self.cursor = (position.x as f32, position.y as f32);
+        self.refresh_hover();
+    }
+
+    fn cursor_left(&mut self) {
+        self.cursor = (-1.0, -1.0);
+        self.refresh_hover();
+    }
+
+    fn refresh_hover(&mut self) {
+        let new_hover = hit_test(&self.hit_regions, self.cursor);
+        if new_hover != self.interaction.hover {
+            self.interaction.hover = new_hover;
+            self.window.request_redraw();
+        }
+    }
+
+    fn mouse_pressed(&mut self) {
+        let hit = hit_test(&self.hit_regions, self.cursor);
+        let mut redraw = false;
+        if hit != Some(UiAction::FocusSearch) && self.app_state.unfocus_search() {
+            redraw = true;
+        }
+        if self.interaction.pressed != hit {
+            self.interaction.pressed = hit;
+            redraw = true;
+        }
+        if redraw {
+            self.window.request_redraw();
+        }
+    }
+
+    fn mouse_released(&mut self) {
+        let pressed = self.interaction.pressed.take();
+        let release_target = hit_test(&self.hit_regions, self.cursor);
+        let mut redraw = true;
+
+        if let (Some(p), Some(r)) = (pressed, release_target) {
+            if p == r {
+                tracing::info!(action = ?p, "ui action triggered");
+                if self.dispatch_action(p) {
+                    redraw = true;
+                }
+            }
+        }
+
+        if redraw {
+            self.window.request_redraw();
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        key: Key,
+        text: Option<winit::keyboard::SmolStr>,
+    ) {
+        if self.app_state.search_focused {
+            match &key {
+                Key::Named(NamedKey::Escape) => {
+                    if self.app_state.apply_action(UiAction::ClearSearch) {
+                        self.window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if self.app_state.unfocus_search() {
+                        self.window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if self.app_state.search_backspace() {
+                        self.window.request_redraw();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            if let Some(text) = text.as_deref() {
+                let mut changed = false;
+                for ch in text.chars() {
+                    if self.app_state.search_input(ch) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.window.request_redraw();
+                    return;
+                }
+            }
+        }
+
+        let action = match &key {
+            Key::Named(NamedKey::Escape) => {
+                event_loop.exit();
+                return;
+            }
+            Key::Named(NamedKey::Space) => Some(UiAction::PlayPause),
+            Key::Named(NamedKey::ArrowLeft) => Some(UiAction::SeekBackward),
+            Key::Named(NamedKey::ArrowRight) => Some(UiAction::SeekForward),
+            Key::Character(s) if s.as_ref().eq_ignore_ascii_case("b") => {
+                Some(UiAction::AddBookmark)
+            }
+            Key::Character(s)
+                if s.as_ref().eq_ignore_ascii_case("f")
+                    && (self.modifiers.state().control_key()
+                        || self.modifiers.state().super_key()) =>
+            {
+                if self.app_state.apply_action(UiAction::NavigateLibrary) {
+                    self.window.request_redraw();
+                }
+                Some(UiAction::FocusSearch)
+            }
+            _ => None,
+        };
+
+        if let Some(action) = action {
+            tracing::info!(?action, "shortcut triggered");
+            if self.dispatch_action(action) {
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn ensure_loaded(&mut self) -> Result<(), String> {
+        let Some(engine) = self.engine.as_mut() else {
+            return Err("audio engine unavailable".to_owned());
+        };
+        let Some(book) = self.app_state.library.current_listening() else {
+            return Err("no audiobook to play".to_owned());
+        };
+        let book_id = book.id;
+        if self.app_state.loaded_audiobook_id == Some(book_id) {
+            return Ok(());
+        }
+        let path = match self.db.first_file_path_for_audiobook(book_id)? {
+            Some(p) => p,
+            None => return Err(format!("audiobook {book_id} has no playable file")),
+        };
+        engine.load(&path)?;
+        let resume_ms = self.app_state.playback_position_ms;
+        if resume_ms > 0 {
+            engine.seek_forward((resume_ms / 1000) as u64)?;
+        }
+        self.app_state.loaded_audiobook_id = Some(book_id);
+        tracing::info!(audiobook = book_id, file = %path, "loaded audio");
+        Ok(())
+    }
+
+    fn dispatch_action(&mut self, action: UiAction) -> bool {
+        match action {
+            UiAction::PlayPause => {
+                if let Err(error) = self.ensure_loaded() {
+                    tracing::warn!(%error, "play/pause skipped");
+                    return false;
+                }
+                if let Some(engine) = self.engine.as_mut() {
+                    if let Err(error) = engine.toggle() {
+                        tracing::error!(%error, "engine toggle failed");
+                        return false;
+                    }
+                    self.app_state.is_playing = engine.is_playing();
+                    self.app_state.playback_position_ms = engine.current_position_ms();
+                    self.persist_position();
+                    return true;
+                }
+                false
+            }
+            UiAction::ContinueListening => {
+                if let Err(error) = self.ensure_loaded() {
+                    tracing::warn!(%error, "continue skipped");
+                    return false;
+                }
+                if let Some(engine) = self.engine.as_mut() {
+                    if let Err(error) = engine.play() {
+                        tracing::error!(%error, "engine play failed");
+                        return false;
+                    }
+                    self.app_state.is_playing = engine.is_playing();
+                }
+                let _ = self.app_state.apply_action(UiAction::NavigatePlayer);
+                true
+            }
+            UiAction::SeekBackward => {
+                if let Err(error) = self.ensure_loaded() {
+                    tracing::warn!(%error, "seek skipped");
+                    return false;
+                }
+                if let Some(engine) = self.engine.as_mut() {
+                    if let Err(error) = engine.seek_backward(SEEK_BACKWARD_SECS) {
+                        tracing::error!(%error, "seek backward failed");
+                        return false;
+                    }
+                    self.app_state.playback_position_ms = engine.current_position_ms();
+                    self.persist_position();
+                    return true;
+                }
+                false
+            }
+            UiAction::SeekForward => {
+                if let Err(error) = self.ensure_loaded() {
+                    tracing::warn!(%error, "seek skipped");
+                    return false;
+                }
+                if let Some(engine) = self.engine.as_mut() {
+                    if let Err(error) = engine.seek_forward(SEEK_FORWARD_SECS) {
+                        tracing::error!(%error, "seek forward failed");
+                        return false;
+                    }
+                    self.app_state.playback_position_ms = engine.current_position_ms();
+                    self.persist_position();
+                    return true;
+                }
+                false
+            }
+            UiAction::SelectChapter(book_id, chapter) => {
+                let path = match self.db.file_path_for_chapter(book_id, chapter) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        tracing::warn!(audiobook = book_id, chapter, "no file for chapter");
+                        return false;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "chapter lookup failed");
+                        return false;
+                    }
+                };
+                let Some(engine) = self.engine.as_mut() else {
+                    tracing::warn!("audio engine unavailable; chapter not played");
+                    return false;
+                };
+                if let Err(error) = engine.load(&path) {
+                    tracing::error!(%error, "engine load failed");
+                    return false;
+                }
+                if let Err(error) = engine.play() {
+                    tracing::error!(%error, "engine play failed");
+                    return false;
+                }
+                self.app_state.loaded_audiobook_id = Some(book_id);
+                self.app_state.is_playing = engine.is_playing();
+                self.app_state.playback_position_ms = engine.current_position_ms();
+                self.persist_position();
+                let _ = self.app_state.apply_action(UiAction::NavigatePlayer);
+                tracing::info!(audiobook = book_id, chapter, "playing chapter");
+                true
+            }
+            UiAction::JumpToBookmark(book_id, position_ms) => {
+                if self.app_state.loaded_audiobook_id != Some(book_id) {
+                    let path = match self.db.first_file_path_for_audiobook(book_id) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            tracing::warn!(audiobook = book_id, "no playable file");
+                            return false;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "book lookup failed");
+                            return false;
+                        }
+                    };
+                    if let Some(engine) = self.engine.as_mut() {
+                        if let Err(error) = engine.load(&path) {
+                            tracing::error!(%error, "engine load failed");
+                            return false;
+                        }
+                    }
+                    self.app_state.loaded_audiobook_id = Some(book_id);
+                }
+                if let Some(engine) = self.engine.as_mut() {
+                    if let Err(error) = engine.seek_to_ms(position_ms) {
+                        tracing::error!(%error, "engine seek failed");
+                        return false;
+                    }
+                    if let Err(error) = engine.play() {
+                        tracing::error!(%error, "engine play failed");
+                        return false;
+                    }
+                    self.app_state.is_playing = engine.is_playing();
+                    self.app_state.playback_position_ms = engine.current_position_ms();
+                    self.persist_position();
+                }
+                let _ = self.app_state.apply_action(UiAction::NavigatePlayer);
+                tracing::info!(audiobook = book_id, position_ms, "jumped to bookmark");
+                true
+            }
+            UiAction::AddLibraryFolder => {
+                let chosen = rfd::FileDialog::new()
+                    .set_title("Pick an audiobook folder")
+                    .pick_folder();
+                let Some(path) = chosen else {
+                    tracing::info!("add-folder cancelled");
+                    return false;
+                };
+                tracing::info!(folder = %path.display(), "scanning new folder");
+                if let Err(error) = self.db.scan_and_ingest_from(&path) {
+                    tracing::error!(%error, "scan failed");
+                    return false;
+                }
+                match Library::from_db(&self.db) {
+                    Ok(library) => {
+                        self.app_state.library = library;
+                        tracing::info!(
+                            books = self.app_state.library.books.len(),
+                            folders = self.app_state.library.folders.len(),
+                            "library re-hydrated after scan"
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "library re-hydrate failed");
+                        false
+                    }
+                }
+            }
+            UiAction::AddBookmark => {
+                if let Some(book) = self.app_state.library.current_listening() {
+                    let book_id = book.id;
+                    let position = self.app_state.playback_position_ms;
+                    if let Err(error) =
+                        self.db.create_bookmark(book_id, position, "Quick bookmark")
+                    {
+                        tracing::error!(%error, "bookmark insert failed");
+                        return false;
+                    }
+                    tracing::info!(audiobook = book_id, position, "bookmark added");
+                    if let Ok(updated) = self.db.load_all_bookmarks_with_titles() {
+                        self.app_state.library.bookmarks = updated
+                            .into_iter()
+                            .map(|b| crate::ui::data::DisplayBookmark {
+                                book_id: b.audiobook_id,
+                                book_title: b.book_title,
+                                note: b.note,
+                                timestamp: crate::ui::data::format_position(b.position_ms),
+                                position_ms: b.position_ms,
+                            })
+                            .collect();
+                    }
+                    return true;
+                }
+                false
+            }
+            _ => self.app_state.apply_action(action),
+        }
+    }
+
+    fn persist_position(&self) {
+        let Some(book_id) = self.app_state.loaded_audiobook_id else {
+            return;
+        };
+        let position_ms = self.app_state.playback_position_ms;
+        let total_ms = self
+            .app_state
+            .library
+            .find_book(book_id)
+            .map(|b| b.total_duration_ms)
+            .unwrap_or(0);
+        let completed = total_ms > 0 && position_ms >= total_ms;
+        if let Err(error) = self
+            .db
+            .upsert_playback_state_minimal(book_id, position_ms, completed)
+        {
+            tracing::error!(%error, "failed to persist playback position");
+        }
     }
 
     fn render(&mut self) -> Result<(), String> {
@@ -338,400 +626,31 @@ impl WindowState {
             return Ok(());
         }
 
-        self.render_count = self.render_count.wrapping_add(1);
-        tracing::info!(
-            render_count = self.render_count,
-            reason = self.pending_redraw_reason.take().unwrap_or("window/system"),
-            "render"
+        if let (Some(engine), Some(_)) = (self.engine.as_ref(), self.app_state.loaded_audiobook_id) {
+            self.app_state.playback_position_ms = engine.current_position_ms();
+            self.app_state.is_playing = engine.is_playing();
+        }
+
+        self.draw_list.clear();
+        self.hit_regions.clear();
+        shell::layout(
+            size.width as f32,
+            size.height as f32,
+            &self.theme,
+            &self.app_state,
+            &self.interaction,
+            &self.font,
+            &mut self.draw_list,
+            &mut self.hit_regions,
         );
 
-        self.renderer
-            .render(&mut self.app_state, size.width, size.height)?;
+        let new_hover = hit_test(&self.hit_regions, self.cursor);
+        if new_hover != self.interaction.hover {
+            self.interaction.hover = new_hover;
+        }
+
         self.window.pre_present_notify();
-        self.gl_surface
-            .swap_buffers(&self.gl_context)
-            .map_err(|error| format!("failed to swap buffers: {error}"))
+        self.renderer
+            .render(size.width, size.height, &self.draw_list.commands)
     }
-
-    fn request_redraw(&mut self, reason: &'static str) {
-        self.pending_redraw_reason = Some(reason);
-        self.window.request_redraw();
-    }
-
-    fn dispatch_action(&mut self, action: UiAction) -> bool {
-        let state_changed = match action {
-            UiAction::ContinueListening
-            | UiAction::PlayPause
-            | UiAction::SeekBackward
-            | UiAction::SeekForward
-            | UiAction::AddBookmark => {
-                self.app_state.interaction.last_action = Some(action);
-                false
-            }
-            _ => self.app_state.apply_action(action),
-        };
-
-        match action {
-            UiAction::SelectBook(book_id) => {
-                self.app_state.current_book_id = Some(book_id);
-                self.app_state.current_file_path = self
-                    .database
-                    .first_file_path_for_audiobook(book_id)
-                    .ok()
-                    .flatten();
-                self.loaded_file_path = None;
-                self.resume_load_requested = false;
-                self.app_state.is_playing = false;
-                self.app_state.playback_status = PlaybackStatus::Idle;
-
-                if let Ok(Some(playback)) = self.database.load_playback_state_for_audiobook(book_id) {
-                    self.app_state.position_ms = playback.position_ms;
-                    self.app_state.playback_last_played_at = Some(playback.last_played_at);
-                    self.app_state.playback_completed = playback.completed;
-                    self.resume_load_requested = true;
-                } else {
-                    self.app_state.position_ms = 0;
-                    self.app_state.playback_last_played_at = None;
-                    self.app_state.playback_completed = false;
-                }
-                self.load_bookmarks_for_current_book();
-
-                if let Some(path) = &self.app_state.current_file_path {
-                    tracing::info!(book_id, path = %path, "selected audio path");
-                } else {
-                    tracing::warn!(book_id, "selected book has no audio file path");
-                }
-                state_changed || self.app_state.current_file_path.is_some()
-            }
-            UiAction::ContinueListening => {
-                let mut changed = false;
-                let book_id = if let Ok(Some(latest)) = self.database.load_latest_playback_state() {
-                    if self.app_state.current_book_id != Some(latest.audiobook_id) {
-                        self.app_state.current_book_id = Some(latest.audiobook_id);
-                        changed = true;
-                    }
-                    if self.app_state.selected_book_id != Some(latest.audiobook_id) {
-                        self.app_state.selected_book_id = Some(latest.audiobook_id);
-                        changed = true;
-                    }
-                    self.app_state.position_ms = latest.position_ms;
-                    self.app_state.playback_last_played_at = Some(latest.last_played_at);
-                    self.app_state.playback_completed = latest.completed;
-                    Some(latest.audiobook_id)
-                } else {
-                    self.app_state.current_book_id.or(self.app_state.selected_book_id)
-                };
-
-                if let Some(book_id) = book_id {
-                    self.app_state.current_file_path = self
-                        .database
-                        .first_file_path_for_audiobook(book_id)
-                        .ok()
-                        .flatten();
-                    self.resume_load_requested = true;
-                    if let Some(path) = &self.app_state.current_file_path {
-                        tracing::info!(book_id, path = %path, "continue listening audio path");
-                    }
-                }
-
-                if self.app_state.current_page != AppPage::Player {
-                    self.app_state.current_page = AppPage::Player;
-                    changed = true;
-                }
-
-                self.loaded_file_path = None;
-                self.app_state.is_playing = false;
-                self.app_state.playback_status = PlaybackStatus::Idle;
-                self.load_bookmarks_for_current_book();
-                state_changed || changed
-            }
-            UiAction::PlayPause => {
-                let playback_changed = self.toggle_playback();
-                self.sync_playback_state_to_db("playback toggle");
-                state_changed || playback_changed
-            }
-            UiAction::SeekBackward => {
-                let changed = self.seek_playback_backward(15);
-                self.sync_playback_state_to_db("seek backward");
-                state_changed || changed
-            }
-            UiAction::SeekForward => {
-                let changed = self.seek_playback_forward(30);
-                self.sync_playback_state_to_db("seek forward");
-                state_changed || changed
-            }
-            UiAction::AddBookmark => {
-                if self.add_bookmark_at_current_position() {
-                    true
-                } else {
-                    state_changed
-                }
-            }
-            _ => state_changed,
-        }
-    }
-
-    fn ensure_loaded_current_file(&mut self) -> bool {
-        let Some(path) = self.app_state.current_file_path.clone() else {
-            let message = "No audio file path is available for the selected book.".to_owned();
-            tracing::warn!("{message}");
-            self.app_state.playback_status = PlaybackStatus::Error(message);
-            self.app_state.is_playing = false;
-            return false;
-        };
-
-        if self.loaded_file_path.as_deref() != Some(path.as_str()) || self.resume_load_requested {
-            self.app_state.playback_status = PlaybackStatus::Loading;
-            tracing::info!(path = %path, "playback load");
-            if let Err(error) = self.playback_engine.load(&path) {
-                tracing::warn!(path = %path, "{error}");
-                self.loaded_file_path = None;
-                self.resume_load_requested = false;
-                self.app_state.playback_status = PlaybackStatus::Error(error);
-                self.app_state.is_playing = false;
-                return false;
-            }
-            self.loaded_file_path = Some(path.clone());
-
-            if self.app_state.position_ms > 0 {
-                let mut resume_position_ms = self.app_state.position_ms.max(0);
-                if self.resume_load_requested {
-                    resume_position_ms =
-                        (resume_position_ms - RESUME_REWIND_SECONDS * 1000).max(0);
-                }
-                let seconds = (resume_position_ms / 1000) as u64;
-                if seconds > 0 {
-                    if let Err(error) = self.playback_engine.seek_forward(seconds) {
-                        tracing::warn!(seconds, "{error}");
-                        self.app_state.playback_status =
-                            PlaybackStatus::Error(format!("Failed to resume from saved position: {error}"));
-                        self.app_state.position_ms = 0;
-                    } else {
-                        self.app_state.position_ms = resume_position_ms;
-                    }
-                }
-            }
-            self.resume_load_requested = false;
-            if !matches!(self.app_state.playback_status, PlaybackStatus::Error(_)) {
-                self.app_state.playback_status = PlaybackStatus::Paused;
-            }
-        }
-
-        true
-    }
-
-    fn toggle_playback(&mut self) -> bool {
-        if self.app_state.current_file_path.is_none() {
-            if let Some(book_id) = self.app_state.current_book_id.or(self.app_state.selected_book_id) {
-                self.app_state.current_file_path = self
-                    .database
-                    .first_file_path_for_audiobook(book_id)
-                    .ok()
-                    .flatten();
-            }
-        }
-
-        if !self.ensure_loaded_current_file() {
-            self.app_state.is_playing = false;
-            return false;
-        }
-
-        let was_playing = self.playback_engine.is_playing();
-        if let Err(error) = self.playback_engine.toggle() {
-            tracing::warn!("{error}");
-            self.app_state.playback_status = PlaybackStatus::Error(error);
-            self.app_state.is_playing = false;
-            return false;
-        }
-
-        self.app_state.is_playing = self.playback_engine.is_playing();
-        self.app_state.position_ms = self.playback_engine.current_position_ms();
-        self.app_state.playback_status = if self.app_state.is_playing {
-            tracing::info!("playback play");
-            PlaybackStatus::Playing
-        } else {
-            if was_playing {
-                tracing::info!("playback pause");
-            }
-            PlaybackStatus::Paused
-        };
-        true
-    }
-
-    fn seek_playback_forward(&mut self, seconds: u64) -> bool {
-        if !self.ensure_loaded_current_file() {
-            return false;
-        }
-        if let Err(error) = self.playback_engine.seek_forward(seconds) {
-            tracing::warn!("{error}");
-            self.app_state.playback_status = PlaybackStatus::Error(error);
-            return false;
-        }
-        self.app_state.position_ms = self.playback_engine.current_position_ms();
-        tracing::info!(seconds, position_ms = self.app_state.position_ms, "playback seek forward");
-        true
-    }
-
-    fn seek_playback_backward(&mut self, seconds: u64) -> bool {
-        if !self.ensure_loaded_current_file() {
-            return false;
-        }
-        if let Err(error) = self.playback_engine.seek_backward(seconds) {
-            tracing::warn!("{error}");
-            self.app_state.playback_status = PlaybackStatus::Error(error);
-            return false;
-        }
-        self.app_state.position_ms = self.playback_engine.current_position_ms();
-        tracing::info!(
-            seconds,
-            position_ms = self.app_state.position_ms,
-            "playback seek backward"
-        );
-        true
-    }
-
-    fn sync_playback_state_to_db(&mut self, reason: &'static str) {
-        self.update_playback_completed_placeholder();
-        if let Some(book_id) = self.app_state.current_book_id.or(self.app_state.selected_book_id) {
-            if let Err(error) = self
-                .database
-                .upsert_playback_state_minimal(
-                    book_id,
-                    self.app_state.position_ms,
-                    self.app_state.playback_completed,
-                )
-            {
-                tracing::warn!("{error}");
-            } else {
-                self.last_playback_persist_at = Instant::now();
-                tracing::info!(
-                    reason,
-                    book_id,
-                    position_ms = self.app_state.position_ms,
-                    "playback state saved"
-                );
-            }
-        }
-    }
-
-    fn update_playback_completed_placeholder(&mut self) {
-        let Some(book_id) = self.app_state.current_book_id.or(self.app_state.selected_book_id) else {
-            self.app_state.playback_completed = false;
-            return;
-        };
-
-        let Some(book) = self.app_state.books.iter().find(|book| book.id == book_id) else {
-            self.app_state.playback_completed = false;
-            return;
-        };
-
-        if book.total_duration_ms <= 0 {
-            // Placeholder: if we cannot trust duration, we keep completion false for now.
-            self.app_state.playback_completed = false;
-            return;
-        }
-
-        let remaining_ms = (book.total_duration_ms - self.app_state.position_ms).max(0);
-        self.app_state.playback_completed = remaining_ms <= 15_000;
-    }
-
-    fn persist_before_exit(&mut self) {
-        if self.loaded_file_path.is_some() {
-            self.app_state.position_ms = self.playback_engine.current_position_ms();
-            self.app_state.is_playing = self.playback_engine.is_playing();
-            self.app_state.playback_status = if self.app_state.is_playing {
-                PlaybackStatus::Playing
-            } else {
-                PlaybackStatus::Paused
-            };
-        }
-        self.sync_playback_state_to_db("app close");
-        tracing::info!(
-            book_id = ?self.app_state.current_book_id.or(self.app_state.selected_book_id),
-            position_ms = self.app_state.position_ms,
-            "playback state persisted on close"
-        );
-    }
-
-    fn handle_periodic_playback_tick(&mut self, now: Instant) {
-        if self.app_state.expire_transient_message_if_needed(now) {
-            self.request_redraw("ui state change");
-        }
-
-        if !matches!(self.app_state.playback_status, PlaybackStatus::Playing) {
-            return;
-        }
-
-        if self.loaded_file_path.is_none() {
-            return;
-        }
-
-        let latest_position = self.playback_engine.current_position_ms().max(0);
-        self.app_state.position_ms = latest_position;
-
-        if now.duration_since(self.last_playback_persist_at) >= PLAYBACK_PERSIST_INTERVAL {
-            self.sync_playback_state_to_db("periodic");
-            tracing::info!(
-                position_ms = self.app_state.position_ms,
-                "periodic playback position save"
-            );
-            self.request_redraw("ui state change");
-        }
-    }
-
-    fn add_bookmark_at_current_position(&mut self) -> bool {
-        let Some(book_id) = self.app_state.current_book_id.or(self.app_state.selected_book_id) else {
-            return false;
-        };
-
-        let position_ms = if self.loaded_file_path.is_some() {
-            self.playback_engine.current_position_ms().max(0)
-        } else {
-            self.app_state.position_ms.max(0)
-        };
-        self.app_state.position_ms = position_ms;
-
-        let note = format!("Bookmark at {}s", position_ms / 1000);
-        if let Err(error) = self.database.create_bookmark(book_id, position_ms, &note) {
-            tracing::warn!(book_id, position_ms, "{error}");
-            self.app_state.playback_status = PlaybackStatus::Error(error);
-            return true;
-        }
-
-        self.load_bookmarks_for_current_book();
-        self.app_state
-            .set_transient_message("Bookmark saved", Duration::from_secs(BOOKMARK_TOAST_SECONDS));
-        tracing::info!(book_id, position_ms, "bookmark saved");
-        true
-    }
-
-    fn load_bookmarks_for_current_book(&mut self) {
-        let Some(book_id) = self.app_state.current_book_id.or(self.app_state.selected_book_id) else {
-            self.app_state.bookmarks.clear();
-            self.app_state.bookmark_count = 0;
-            return;
-        };
-
-        match self.database.list_bookmarks(book_id) {
-            Ok(bookmarks) => {
-                self.app_state.bookmark_count = bookmarks.len() as u32;
-                self.app_state.bookmarks = bookmarks;
-            }
-            Err(error) => {
-                tracing::warn!(book_id, "{error}");
-                self.app_state.bookmarks.clear();
-                self.app_state.bookmark_count = 0;
-            }
-        }
-    }
-}
-
-fn choose_gl_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
-    configs
-        .max_by_key(|config| config.num_samples())
-        .expect("at least one OpenGL config should be available")
-}
-
-fn non_zero(value: u32) -> NonZeroU32 {
-    NonZeroU32::new(value.max(1)).expect("value is forced to be non-zero")
 }

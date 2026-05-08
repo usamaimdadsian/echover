@@ -1,7 +1,12 @@
 pub mod action;
+pub mod data;
+pub mod font;
 pub mod geometry;
 pub mod hit;
+pub mod icons;
+pub mod pages;
 pub mod primitives;
+pub mod shell;
 pub mod state;
-pub mod text;
 pub mod theme;
+pub mod widgets;

@@ -105,6 +105,19 @@ impl PlaybackEngine for RodioPlaybackEngine {
         Ok(())
     }
 
+    fn seek_to_ms(&mut self, position_ms: i64) -> Result<(), String> {
+        let Some(path) = self.loaded_path.clone() else {
+            return Err("no audio file is loaded".to_owned());
+        };
+        let was_playing = !self.player.is_paused();
+        let target = Duration::from_millis(position_ms.max(0) as u64);
+        self.reload_at_position(&path, target)?;
+        if was_playing {
+            self.player.play();
+        }
+        Ok(())
+    }
+
     fn is_playing(&self) -> bool {
         self.loaded_path.is_some() && !self.player.is_paused()
     }
